@@ -1,5 +1,119 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
-<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒上报对账台</title>
+<style>
+body{font:14px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+section{background:white;padding:18px 20px;margin:14px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,select,button{font:inherit;padding:7px;margin:3px}
+input,select{border:1px solid #cbd5e1;border-radius:6px}
+button{background:#174ea6;color:white;border:0;border-radius:6px;cursor:pointer}
+button.warn{background:#b45309}button.danger{background:#b91c1c}button.ghost{background:#e2e8f0;color:#172033}
+table{border-collapse:collapse;width:100%;margin-top:8px}th,td{border-bottom:1px solid #e5e7eb;padding:7px 8px;text-align:left;vertical-align:top;font-size:13px}
+th{background:#f1f5f9}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;white-space:nowrap}
+.s-accepted{background:#dcfce7;color:#166534}.s-submitted{background:#dbeafe;color:#1e40af}
+.s-returned{background:#ffedd5;color:#9a3412}.s-failed,.s-overdue{background:#fee2e2;color:#991b1b}
+.s-manual_review{background:#fef9c3;color:#854d0e}.s-pending{background:#e5e7eb;color:#374151}
+.blocked{color:#b45309;font-weight:600}.muted{color:#64748b;font-size:12px}
+pre{background:#111827;color:#d1fae5;padding:12px;overflow:auto;border-radius:8px;max-height:260px}
+h2{margin:0 0 6px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+</style>
+<h1>药物警戒上报对账台</h1>
+<p class="muted">报文按案例修订不可变生成，超时重试沿用同一幂等键，回执仅接受与当前版本一致的受理/退回。操作按钮由页面动作注册表统一维护。</p>
+
+<section>
+  <div class="row">
+    <label>用户 <input id="user" value="global-admin" style="width:120px"></label>
+    <label>角色
+      <select id="role"><option>global_admin</option><option>regional_lead</option><option>medical_reviewer</option><option>reporter</option></select>
+    </label>
+    <label>区域 <input id="region" value="" style="width:80px" placeholder="如 CN"></label>
+    <button onclick="load()">刷新状态</button>
+    <button class="ghost" onclick="loadCases()">查看案例</button>
+    <span id="clock" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>上报对账队列（当前状态与阻塞原因）</h2>
+  <p class="muted">区域负责人仅见本区域；全局管理员可见全部并可重放失败任务。</p>
+  <table><thead><tr><th>报告</th><th>国家/期限</th><th>报文版本</th><th>当前状态</th><th>阻塞原因</th><th>页面操作</th></tr></thead>
+  <tbody id="queue"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody></table>
+  <div class="row" style="margin-top:10px">
+    <button class="ghost" onclick="reconcileAll()">全部主动对账</button>
+    <button class="danger" onclick="replayAll()">全局重放失败任务（仅全局管理员）</button>
+  </div>
+</section>
+
+<section id="sim" style="display:none">
+  <h2>监管侧模拟（仅全局管理员）</h2>
+  <div class="row">
+    <input id="simKey" placeholder="幂等键 idempotency_key" style="width:300px">
+    <select id="simDecision"><option value="accepted">受理 accepted</option><option value="returned">退回 returned</option></select>
+    <input id="simReason" placeholder="退回原因（退回必填）" style="width:220px">
+    <input id="simDue" placeholder="补件期限 2026-10-10T00:00:00Z" style="width:220px">
+    <button class="warn" onclick="deliverReceipt()">送达回执</button>
+  </div>
+</section>
+
+<section>
+  <h2>案例列表</h2>
+  <table><thead><tr><th>案例号</th><th>区域</th><th>产品/事件</th><th>修订</th><th>严重</th><th>上报截止</th></tr></thead>
+  <tbody id="cases"></tbody></table>
+  <pre id="detail" style="display:none"></pre>
+</section>
+
+<script>
+const $=id=>document.getElementById(id);
+function headers(){return {'X-User-Id':$('user').value||'x','X-Role':$('role').value,'X-Region':$('region').value,'Content-Type':'application/json'}}
+async function api(path,opts={}){let r=await fetch(path,{headers:headers(),...opts});let j=await r.json();if(!r.ok)alert((j.error||'error')+'：'+j.message);return j}
+function tag(s){return `<span class="tag s-${s}">${statusLabel(s)}</span>`}
+function statusLabel(s){return {pending:'待上报',overdue:'已逾期',submitted:'已发送待回执',accepted:'已完成受理',returned:'退回待补件',failed:'发送失败待重放',manual_review:'人工复核'}[s]||s}
+function blockCell(r){if(!r.blocked)return '<span class="muted">—</span>';let d=r.block_detail?`<div class="muted">${typeof r.block_detail==='object'?JSON.stringify(r.block_detail):r.block_detail}</div>`:'';return `<span class="blocked">${r.block_reason_label||r.block_reason_code}</span>${d}`}
+function actionButtons(r){return (r.actions||[]).map(a=>{
+  let cls=a.danger?'danger':(a.key==='retry'||a.key==='reconcile'?'warn':'');
+  let ep=a.endpoint.replace('{id}',r.id);
+  return `<button class="${cls}" onclick="act('${ep}',${r.id})">${a.label}</button>`}).join(' ')||'<span class="muted">无可用操作</span>'}
+async function act(endpoint,id,extra={}){
+  let j=await api(endpoint,{method:'POST',body:JSON.stringify(extra)});
+  if(endpoint.includes('retry')||endpoint.includes('resubmit')||endpoint.includes('submit')){
+    let key=j.message&&j.message.idempotency_key;if(key){$('simKey').value=key}
+    alert('尝试结果：'+(j.attempt||'ok')+'\n状态：'+(j.report&&j.report.status_label||''))
+  }
+  load();
+}
+async function load(){
+  $('sim').style.display=$('role').value==='global_admin'?'block':'none';
+  let s=await api('/api/state');$('clock').textContent='服务器时间 '+s.server_time;
+  let q=s.reconciliation||[];
+  $('queue').innerHTML=q.length?q.map(r=>`<tr>
+    <td>#${r.id}<div class="muted">${r.case_no||''} · ${r.region}</div></td>
+    <td>${r.country}<div class="muted">截止 ${r.due_at}${r.late?' · <b>逾期</b>':''}</div></td>
+    <td>报文 rev ${r.message_case_revision??'—'}<div class="muted">案例 rev ${r.current_case_revision}</div></td>
+    <td>${tag(r.status)}</td>
+    <td>${blockCell(r)}</td>
+    <td>${actionButtons(r)}</td></tr>`).join('')
+    :'<tr><td colspan="6" class="muted">没有阻塞中的上报</td></tr>';
+  let cs=s.cases||[];
+  $('cases').innerHTML=cs.map(c=>`<tr onclick="showCase(${c.id})" style="cursor:pointer">
+    <td>${c.case_no}</td><td>${c.region}</td><td>${c.product} / ${c.event_term}</td>
+    <td>rev ${c.revision}</td><td>${c.serious?(c.fatal?'严重/死亡':'严重'):'非严重'}</td><td>${c.report_due_at}</td></tr>`).join('');
+}
+async function showCase(id){
+  let d=await api('/api/cases/'+id);$('detail').style.display='block';
+  $('detail').textContent=JSON.stringify({case:d.case,reports:d.reports,messages:d.messages,
+    receipts:'见对账队列/审计'},null,2);
+}
+async function loadCases(){load()}
+async function reconcileAll(){let j=await api('/api/reconcile',{method:'POST',body:'{}'});
+  alert('已对账 '+j.checked+' 条在途报文');load()}
+async function replayAll(){if(!confirm('确认以全局管理员身份重放所有失败任务？'))return;
+  let j=await api('/api/admin/replay-failed',{method:'POST',body:'{}'});
+  alert('已重放 '+j.replayed.length+' 条');load()}
+async function deliverReceipt(){
+  let body={idempotency_key:$('simKey').value.trim(),decision:$('simDecision').value};
+  if(body.decision==='returned'){body.return_reason=$('simReason').value;body.supplement_due_at=$('simDue').value}
+  let j=await api('/api/regulator/receipts',{method:'POST',body:JSON.stringify(body)});
+  if(j&&j.outcome!==undefined)alert('回执处理结果：'+(j.applied?'已应用':'未应用 ('+j.outcome+')'));
+  load();
+}
+load();
+</script>
