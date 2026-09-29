@@ -13,39 +13,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from reconciliation.errors import ApiError
+from reconciliation.service import ReconciliationService
+from reconciliation.timeutil import iso, parse_time, utcnow
+
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    current = value or utcnow()
-    return current.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def parse_time(value: str | None, default: datetime | None = None) -> datetime:
-    if not value:
-        if default is None:
-            raise ApiError(400, "missing_time", "必须提供 ISO 8601 时间")
-        return default
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> datetime:
@@ -149,6 +122,43 @@ class Repository:
                 detail_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS report_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL REFERENCES reports(id),
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                case_revision INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS report_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL REFERENCES reports(id),
+                message_id INTEGER NOT NULL REFERENCES report_messages(id),
+                idempotency_key TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT,
+                supplement_due_at TEXT,
+                disposition TEXT NOT NULL DEFAULT 'applied',
+                received_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reconciliation_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL UNIQUE REFERENCES reports(id),
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                message_id INTEGER REFERENCES report_messages(id),
+                status TEXT NOT NULL DEFAULT 'not_submitted',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                next_retry_at TEXT,
+                blocking_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -167,6 +177,7 @@ class Repository:
 class PharmacovigilanceService:
     def __init__(self, db_path: str | Path):
         self.repo = Repository(db_path)
+        self.recon = ReconciliationService(self.repo.conn)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -284,6 +295,10 @@ class PharmacovigilanceService:
                 "UPDATE cases SET revision=?,received_at=?,report_due_at=?,updated_at=? WHERE id=?",
                 (revision, iso(received), iso(due), iso(), case_id),
             )
+            self.recon.invalidate_for_case(
+                conn, case_id, actor, role,
+                f"案例新增随访，修订 {case['revision']} → {revision}，未决上报报文失效，请人工复核",
+            )
             Repository.audit(conn, case_id, actor, role, "followup_added", {"revision": revision, "source": source})
             return {"case": dict(self._case(conn, case_id)), "revision": revision}
 
@@ -314,6 +329,10 @@ class PharmacovigilanceService:
                 """UPDATE cases SET serious=?,fatal=?,causality=?,report_due_at=?,revision=?,updated_at=? WHERE id=?""",
                 (int(serious), int(fatal), causality, iso(due), revision, iso(), case_id),
             )
+            self.recon.invalidate_for_case(
+                conn, case_id, actor, role,
+                f"医学审核修订 {expected} → {revision}（严重性/死亡/关联性变更），未决上报报文失效，请人工复核",
+            )
             conn.execute(
                 """INSERT INTO medical_reviews(case_id,case_revision,serious,fatal,causality,rationale,reviewer,created_at)
                    VALUES(?,?,?,?,?,?,?,?)""",
@@ -337,25 +356,12 @@ class PharmacovigilanceService:
                 cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "report_exists", "该国家报告已经存在") from exc
+            self.recon.ensure_task(conn, cur.lastrowid, case_id)
             Repository.audit(conn, case_id, actor, role, "report_created", {"report_id": cur.lastrowid, "country": country})
             return dict(conn.execute("SELECT * FROM reports WHERE id=?", (cur.lastrowid,)).fetchone())
 
     def submit_report(self, report_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
-        if role not in {"regional_lead", "global_admin"}:
-            raise ApiError(403, "submit_forbidden", "当前角色不能提交监管报告")
-        with self.repo.tx() as conn:
-            row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
-            if not row:
-                raise ApiError(404, "report_not_found", "报告不存在")
-            if not self.can_access(dict(row), role, region):
-                raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
-            if row["status"] == "submitted":
-                return {"report": dict(row), "idempotent": True}
-            now = parse_time(body.get("submitted_at"), utcnow())
-            late = int(now > parse_time(row["due_at"]))
-            conn.execute("UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=? WHERE id=?", (iso(now), actor, late, report_id))
-            Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
-            return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
+        return self.recon.submit(report_id, actor, role, region, body)
 
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "global_admin":
@@ -372,6 +378,10 @@ class PharmacovigilanceService:
                 raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
             conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
             conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
+            self.recon.invalidate_for_case(
+                conn, source_id, actor, role,
+                f"案例被合并入案例 {target_id}，未决上报报文失效，请人工复核",
+            )
             Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
             Repository.audit(conn, source_id, actor, role, "case_merged_into", {"target_case_id": target_id})
             return {"case": dict(self._case(conn, source_id)), "idempotent": False}
@@ -437,9 +447,17 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/reconciliation":
+            return 200, {"tasks": self.service.recon.list_tasks(role, region)}
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit():
+            report_id, sub = int(parts[2]), parts[3]
+            if sub == "messages":
+                return 200, {"messages": self.service.recon.list_messages(report_id, role, region)}
+            if sub == "receipts":
+                return 200, {"receipts": self.service.recon.list_receipts(report_id, role, region)}
         raise ApiError(404, "not_found", "接口不存在")
 
     def _dispatch_post(self, path: str, body: dict[str, Any]) -> Any:
@@ -461,6 +479,14 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.merge_cases(case_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit():
+            report_id, action = int(parts[2]), parts[3]
+            if action == "receipt":
+                return 200, self.service.recon.receive_receipt(report_id, actor, role, body)
+            if action == "replay":
+                return 200, self.service.recon.replay(report_id, actor, role, body)
+            if action == "reconcile":
+                return 200, self.service.recon.manual_review(report_id, actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _handle(self, method: str) -> None:
@@ -470,6 +496,34 @@ class Handler(BaseHTTPRequestHandler):
                 page = (self.web_root / "index.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                return
+            if method == "GET" and parsed.path == "/reconciliation":
+                page = (self.web_root / "reconciliation.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                return
+            if method == "GET" and parsed.path.startswith("/static/"):
+                name = parsed.path.split("/static/", 1)[1]
+                if "/" in name or ".." in name:
+                    raise ApiError(404, "not_found", "接口不存在")
+                static_file = self.web_root / name
+                if not static_file.is_file():
+                    raise ApiError(404, "not_found", "接口不存在")
+                page = static_file.read_bytes()
+                if name.endswith(".js"):
+                    ctype = "text/javascript; charset=utf-8"
+                elif name.endswith(".css"):
+                    ctype = "text/css; charset=utf-8"
+                else:
+                    ctype = "application/octet-stream"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(page)))
                 self.end_headers()
                 self.wfile.write(page)
@@ -494,6 +548,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def create_server(db_path: str | Path, host: str = "127.0.0.1", port: int = PORT) -> ThreadingHTTPServer:
     service = PharmacovigilanceService(db_path)
+    resumed = service.recon.resume_pending()
+    if resumed:
+        print(f"reconciliation: {len(resumed)} 笔未决上报在服务重启后继续对账")
     web_root = Path(__file__).resolve().parent / "static"
     handler = type("PharmacovigilanceHandler", (Handler,), {"service": service, "web_root": web_root})
     return ThreadingHTTPServer((host, port), handler)
